@@ -1,0 +1,541 @@
+"""
+"""
+"""
+Pipeline SWC (cbar → mm) and ET (Eq. 6–9)
+"""
+
+import re
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# Parameters
+# Baseline FC (% vol) at field capacity (starting point)
+FC_BASE = 29.0
+# Sensor depths (m)
+DEPTH_30M = 0.3
+DEPTH_50M = 0.5
+
+# Convenzione segno per ET (Allen et al., 1998): ET = P + I - ΔSWC
+USE_STANDARD_MINUS_DELTA_S = True
+
+# Directory I/O
+BASE_DIR = Path(r"C:\Users")
+FILES = [
+    "Hydro_retentioncbar_MB17.xlsx",
+    "Hydro_retentioncbar_MB18.xlsx",
+    "Hydro_retentioncbar_SM_17.xlsx",
+    "Hydro_retentioncbar_SM_18.xlsx",
+]
+
+# Pearson p-value (opzionale)
+try:
+    from scipy.stats import pearsonr
+    _SCIPY = True
+except Exception:
+    _SCIPY = False
+
+FORMULA_NOTE = (
+    "Conversione intuitiva cbar → mm:\n"
+    "1) Rapporto rispetto alla suzione tipica alla capacità di campo: "
+    "   tensione_relativa = cbar / FC_suction_bar (≈ 15 bar).\n"
+    "2) Acqua potenziale a capacità di campo nello strato: "
+    "   FC_percent × spessore_strato_m × 10  (poiché 1% vol = 10 mm).\n"
+    "3) Contenuto idrico stimato: "
+    "   mm = tensione_relativa × (FC_percent × spessore_m × 10).\n\n"
+    "Formula compatta:\n"
+    "   SWC_mm = (cbar / FC_suction_bar) × FC_percent × depth_m × 10\n"
+    "Dove:\n"
+    " - cbar: lettura del tensiometro (centibar)\n"
+    " - FC_suction_bar: suzione (in bar) corrispondente alla FC (≈15)\n"
+    " - FC_percent: % volumetrica a FC (es. 29% × moltiplicatore suolo)\n"
+    " - depth_m: spessore dello strato (m)\n"
+    " - 10: fattore di conversione (1% vol = 10 mm)\n"
+)
+
+# Basic utility
+def to_numeric(series: pd.Series) -> pd.Series:
+    if pd.api.types.is_numeric_dtype(series):
+        return pd.to_numeric(series, errors="coerce")
+    s = series.astype(str).str.replace(",", ".", regex=False)
+    s = s.replace({"": np.nan, "nan": np.nan, "None": np.nan})
+    return pd.to_numeric(s, errors="coerce")
+
+def extract_suffix(name30: str, name50: str) -> str:
+    txt = f"{name30}_{name50}"
+    m = re.search(r"(MB|SM)\s*_?\s*(\d{2})", txt, flags=re.IGNORECASE)
+    if m:
+        return f"{m.group(1).upper()}{m.group(2).upper()}"
+    parts = [p for p in re.split(r"[_\s]+", name30) if p]
+    suffix = parts[-1] if parts else "OUT"
+    suffix = re.sub(r"\W", "", suffix)
+    return suffix or "OUT"
+
+def detect_group(name30: str, name50: str) -> str:
+    txt = f"{name30}_{name50}".lower()
+    if "sm" in txt: return "SM"
+    if "mb" in txt: return "MB"
+    return "MB"
+
+def find_col(vnames, needles):
+    low = [n.lower() for n in (needles if isinstance(needles, (list, tuple)) else [needles])]
+    for v in vnames:
+        lv = v.lower()
+        if any(n in lv for n in low):
+            return v
+    return None
+
+def insert_after(df: pd.DataFrame, new_col: str, data: pd.Series, after_col: str):
+    if after_col not in df.columns:
+        df[new_col] = data
+        return df
+    cols = list(df.columns)
+    i = cols.index(after_col) + 1
+    left = cols[:i]
+    right = cols[i:]
+    return pd.concat([df[left], pd.DataFrame({new_col: data}, index=df.index), df[right]], axis=1)
+
+def summarize(df: pd.DataFrame, series_names: list) -> pd.DataFrame:
+    rows = []
+    nrows = len(df)
+    for name in series_names:
+        if name in df.columns:
+            x = pd.to_numeric(df[name], errors="coerce")
+            rows.append({
+                "Series": name,
+                "N": int(x.notna().sum()),
+                "Mean": float(x.mean(skipna=True)) if x.notna().any() else np.nan,
+                "Std": float(x.std(skipna=True)) if x.notna().sum() > 1 else np.nan,
+                "Min": float(x.min(skipna=True)) if x.notna().any() else np.nan,
+                "Max": float(x.max(skipna=True)) if x.notna().any() else np.nan,
+                "Missing": int(nrows - x.notna().sum()),
+            })
+        else:
+            rows.append({"Series": name, "N": 0, "Mean": np.nan, "Std": np.nan,
+                         "Min": np.nan, "Max": np.nan, "Missing": nrows})
+    return pd.DataFrame(rows, columns=["Series", "N", "Mean", "Std", "Min", "Max", "Missing"])
+
+def pair_metrics(a: pd.Series, b: pd.Series) -> dict:
+    """r (e p), MSE, RMSE, Bias, MAE, Var/Std, Cov (pairwise, NaN dropped)."""
+    aa = pd.to_numeric(a, errors="coerce")
+    bb = pd.to_numeric(b, errors="coerce")
+    mask = aa.notna() & bb.notna()
+    aa = aa[mask]
+    bb = bb[mask]
+    n = int(len(aa))
+    if n == 0:
+        return {"N": 0, "r": np.nan, "p": np.nan,
+                "MSE": np.nan, "RMSE": np.nan, "Bias": np.nan, "MAE": np.nan,
+                "Var_A": np.nan, "Var_B": np.nan, "Std_A": np.nan, "Std_B": np.nan, "Cov": np.nan}
+    if _SCIPY:
+        r, p = pearsonr(aa, bb)
+    else:
+        r = float(pd.Series(aa).corr(pd.Series(bb)))
+        p = np.nan
+    err = aa - bb
+    mse = float(np.mean(err**2))
+    rmse = float(np.sqrt(mse))
+    bias = float(np.mean(err))
+    mae = float(np.mean(np.abs(err)))
+    var_a = float(np.var(aa, ddof=1)) if n > 1 else np.nan
+    var_b = float(np.var(bb, ddof=1)) if n > 1 else np.nan
+    std_a = float(np.sqrt(var_a)) if n > 1 else np.nan
+    std_b = float(np.sqrt(var_b)) if n > 1 else np.nan
+    cov = float(np.cov(aa, bb, ddof=1)[0,1]) if n > 1 else np.nan
+    return {"N": n, "r": r, "p": p, "MSE": mse, "RMSE": rmse, "Bias": bias, "MAE": mae,
+            "Var_A": var_a, "Var_B": var_b, "Std_A": std_a, "Std_B": std_b, "Cov": cov}
+
+# Plot helpers (Spyder)
+def detect_time_axis(df: pd.DataFrame):
+    """Prova a individuare una colonna temporale (date/time) o usa un indice 1..N."""
+    cand_names = [c for c in df.columns if any(k in c.lower() for k in
+                   ["date","data","giorno","day","time","datetime"])]
+    for c in cand_names:
+        dt = pd.to_datetime(df[c], errors="coerce", dayfirst=True)
+        if dt.notna().sum() > 0:
+            return dt
+    for c in df.columns:
+        if pd.api.types.is_datetime64_any_dtype(df[c]):
+            return df[c]
+    return pd.RangeIndex(start=1, stop=len(df)+1, step=1)
+
+def ensure_plots_dir(base_dir: Path) -> Path:
+    out = base_dir / "plots"
+    out.mkdir(exist_ok=True)
+    return out
+
+def plot_ts(x, ys: list, labels: list, title: str, ylabel: str, save_path: Path, show_plots=True):
+    plt.figure()
+    for y, lab in zip(ys, labels):
+        plt.plot(x, y, label=lab)
+    plt.title(title)
+    plt.xlabel("Time / Day")
+    plt.ylabel(ylabel)
+    plt.grid(True, which="both", linestyle="--", alpha=0.4)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150)
+    if show_plots:
+        plt.show()
+    else:
+        plt.close()
+
+def plot_scatter(a, b, label_a: str, label_b: str, title: str, save_path: Path, show_plots=True):
+    mask = pd.notna(a) & pd.notna(b)
+    aa = np.array(a[mask], dtype=float)
+    bb = np.array(b[mask], dtype=float)
+    plt.figure()
+    plt.scatter(aa, bb, s=18, alpha=0.75)
+    if len(aa) and len(bb):
+        mn = float(min(aa.min(), bb.min()))
+        mx = float(max(aa.max(), bb.max()))
+        plt.plot([mn, mx], [mn, mx], linestyle="--", linewidth=1)
+        if len(aa) >= 2:
+            m, q = np.polyfit(aa, bb, 1)
+            xfit = np.linspace(mn, mx, 100)
+            yfit = m * xfit + q
+            plt.plot(xfit, yfit, linewidth=1)
+            plt.text(0.02, 0.98, f"y = {m:.3f}x + {q:.3f}", transform=plt.gca().transAxes,
+                     ha="left", va="top")
+    plt.title(title)
+    plt.xlabel(label_a)
+    plt.ylabel(label_b)
+    plt.grid(True, linestyle="--", alpha=0.4)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150)
+    if show_plots:
+        plt.show()
+    else:
+        plt.close()
+
+# SWC: cbar → mm (indipendente dall'ET)
+@dataclass(frozen=True)
+class SWCConverter:
+    """
+    Converte letture in cbar in contenuto idrico (mm) in modo trasparente.
+
+    SWC_mm = (cbar / FC_suction_bar) × FC_percent × depth_m × 10
+
+    - FC_percent: % volumetrica alla FC (es. 29 × fattore suolo)
+    - FC_suction_bar: suzione tipica alla FC (≈15 bar)
+    - 10: 1% vol = 10 mm
+    """
+    fc_percent: float             # es. 29 × 1.1 (MB) oppure 29 × 1.2 (SM)
+    fc_suction_bar: float = 15.0  # tipicamente 15 bar
+    percent_to_mm: float = 10.0   # 1% vol = 10 mm
+
+    def cbar_to_mm(self, cbar: pd.Series, depth_m: float) -> pd.Series:
+        c = to_numeric(cbar)
+        rel = c / self.fc_suction_bar
+        mm_at_fc = self.fc_percent * depth_m * self.percent_to_mm
+        return rel * mm_at_fc
+
+# ET helpers
+def compute_ET_variants(P, I, RO, DP, CR, DSF, dS):
+    """
+    Calcola tre varianti di ET:
+      - Eq.7 (completa): I + P - RO - DP + CR + DSF ± dS
+      - Eq.8 (semplice): I + P ± dS
+      - Eq.9 (no P)   : I ± dS
+    Il segno di dS è gestito da USE_STANDARD_MINUS_DELTA_S.
+    """
+    sign = -1 if USE_STANDARD_MINUS_DELTA_S else +1
+    ET7_full  = I + P - RO - DP + CR + DSF + sign * dS
+    ET8_simpl = I + P + sign * dS
+    ET9_nop   = I       + sign * dS
+    return ET7_full, ET8_simpl, ET9_nop
+
+# Aggregatore complessivo (MB/SM)
+AGG = {
+    "MB": {
+        "swc30_mm_all": [], "swc50_mm_all": [],
+        "pairs30_cbar": [], "pairs30_mm": [],
+        "pairs50_cbar": [], "pairs50_mm": []
+    },
+    "SM": {
+        "swc30_mm_all": [], "swc50_mm_all": [],
+        "pairs30_cbar": [], "pairs30_mm": [],
+        "pairs50_cbar": [], "pairs50_mm": []
+    },
+}
+
+def extend_list_from_series(lst: list, series: pd.Series):
+    lst.extend(pd.to_numeric(series, errors="coerce").dropna().tolist())
+
+def series_stats_from_list(values: list):
+    if len(values) == 0:
+        return {"N": 0, "Mean (mm)": np.nan, "Std (mm)": np.nan, "Cv": np.nan}
+    x = pd.to_numeric(pd.Series(values), errors="coerce").dropna()
+    if len(x) == 0:
+        return {"N": 0, "Mean (mm)": np.nan, "Std (mm)": np.nan, "Cv": np.nan}
+    mean = float(x.mean())
+    std  = float(x.std(ddof=1)) if len(x) > 1 else np.nan
+    cv   = (std/mean) if (pd.notna(mean) and mean != 0 and pd.notna(std)) else np.nan
+    return {"N": int(len(x)), "Mean (mm)": mean, "Std (mm)": std, "Cv": cv}
+
+def overall_tables() -> (pd.DataFrame, pd.DataFrame):
+    """Costruisce tabelle complessive (MB/SM): Performance e Correlation."""
+    rows_perf = []
+    rows_corr = []
+    for group in ["SM","MB"]:
+        label = "Self-mulch (SM)" if group == "SM" else "Mung bean (MB)"
+        s30 = series_stats_from_list(AGG[group]["swc30_mm_all"])
+        s50 = series_stats_from_list(AGG[group]["swc50_mm_all"])
+
+        pm30 = pair_metrics(pd.Series(AGG[group]["pairs30_cbar"]),
+                            pd.Series(AGG[group]["pairs30_mm"]))
+        pm50 = pair_metrics(pd.Series(AGG[group]["pairs50_cbar"]),
+                            pd.Series(AGG[group]["pairs50_mm"]))
+
+        rows_perf.append({
+            "Mulching type": label, "Soil water content": "SWC (mm)",
+            "Soil depth (cm)": "0-30", "N": s30["N"], "Mean (mm)": s30["Mean (mm)"],
+            "Std (mm)": s30["Std (mm)"], "Cv": s30["Cv"],
+            "RMSE (cbar vs mm)": pm30["RMSE"], "MSE (cbar vs mm)": pm30["MSE"],
+            "MAE (cbar vs mm)": pm30["MAE"], "Bias (cbar−mm)": pm30["Bias"],
+            "r (cbar vs mm)": pm30["r"], "p-value": pm30["p"]
+        })
+        rows_perf.append({
+            "Mulching type": label, "Soil water content": "SWC (mm)",
+            "Soil depth (cm)": "30-50", "N": s50["N"], "Mean (mm)": s50["Mean (mm)"],
+            "Std (mm)": s50["Std (mm)"], "Cv": s50["Cv"],
+            "RMSE (cbar vs mm)": pm50["RMSE"], "MSE (cbar vs mm)": pm50["MSE"],
+            "MAE (cbar vs mm)": pm50["MAE"], "Bias (cbar−mm)": pm50["Bias"],
+            "r (cbar vs mm)": pm50["r"], "p-value": pm50["p"]
+        })
+
+        rows_corr.append({
+            "Mulching type": label, "Pair": "0-30 cbar vs 0-30 mm",
+            **{k: pm30[k] for k in ["N","r","p","MSE","RMSE","Bias","MAE","Var_A","Var_B","Std_A","Std_B","Cov"]}
+        })
+        rows_corr.append({
+            "Mulching type": label, "Pair": "0-50 cbar vs 0-50 mm",
+            **{k: pm50[k] for k in ["N","r","p","MSE","RMSE","Bias","MAE","Var_A","Var_B","Std_A","Std_B","Cov"]}
+        })
+
+    perf_df = pd.DataFrame(rows_perf, columns=[
+        "Mulching type","Soil water content","Soil depth (cm)",
+        "N","Mean (mm)","Std (mm)","Cv",
+        "RMSE (cbar vs mm)","MSE (cbar vs mm)","MAE (cbar vs mm)","Bias (cbar−mm)",
+        "r (cbar vs mm)","p-value"
+    ])
+    corr_df = pd.DataFrame(rows_corr, columns=[
+        "Mulching type","Pair","N","r","p","MSE","RMSE","Bias","MAE",
+        "Var_A","Var_B","Std_A","Std_B","Cov"
+    ])
+    return perf_df, corr_df
+
+# Pipeline for each file
+def process_file(path_in: Path):
+    print(f"---\nElaboro: {path_in}")
+    try:
+        df = pd.read_excel(path_in)  # primo foglio
+    except Exception as e:
+        print(f"Impossibile leggere {path_in}: {e}")
+        return
+
+    if df.shape[1] < 2:
+        print(f"File {path_in.name}: servono almeno due colonne (SWC30_*, SWC50_*).")
+        return
+
+    # Colonne SWC in cbar
+    name30 = find_col(df.columns, ["SWC30"])
+    name50 = find_col(df.columns, ["SWC50"])
+    if not name30 or not name50:
+        print(f"File {path_in.name}: non trovo entrambe le colonne SWC30_* e SWC50_*.")
+        return
+
+    # Gruppo MB/SM -> FC effettivo (stessa FC per 0.30 e 0.50 m, per file)
+    group = detect_group(name30, name50)  # 'MB' o 'SM'
+    fc_mult = 1.1 if group == "MB" else 1.2
+    FC_effective = FC_BASE * fc_mult
+
+    # Conversione cbar -> mm (umana e indipendente dall'ET)
+    converter = SWCConverter(fc_percent=FC_effective)
+    cbar30 = to_numeric(df[name30])
+    cbar50 = to_numeric(df[name50])
+    swc_mm_30 = converter.cbar_to_mm(cbar30, DEPTH_30M)
+    swc_mm_50 = converter.cbar_to_mm(cbar50, DEPTH_50M)
+
+    # ΔSWC (mm) per ET: primo giorno rispetto a 0
+    dS_30 = swc_mm_30.diff().fillna(swc_mm_30)
+    dS_50 = swc_mm_50.diff().fillna(swc_mm_50)
+
+    # Flussi idrici (se assenti -> 0)
+    vnames = df.columns
+    def col_or_zero(colname):
+        return to_numeric(df[colname]) if colname else pd.Series(0.0, index=df.index)
+    col_I  = find_col(vnames, ["Irrigation", "I_mm", "Irr", "I"])
+    col_P  = find_col(vnames, ["Precipitation", "Precip", "Rainfall", "Rain", "P"])
+    col_RO = find_col(vnames, ["Runoff", "RO"])
+    col_DP = find_col(vnames, ["DeepPercolation", "DP"])
+    col_CR = find_col(vnames, ["CapillaryRise", "CR"])
+    col_DSF= find_col(vnames, ["DeltaSF", "DSF", "dSF", "ΔSF"])
+    I  = col_or_zero(col_I)
+    P  = col_or_zero(col_P)
+    RO = col_or_zero(col_RO)
+    DP = col_or_zero(col_DP)
+    CR = col_or_zero(col_CR)
+    DSF= col_or_zero(col_DSF)
+
+    # ET (Eq. 7, 8, 9) per 0–30 e 0–50
+    ET7_30, ET8_30, ET9_30 = compute_ET_variants(P, I, RO, DP, CR, DSF, dS_30)
+    ET7_50, ET8_50, ET9_50 = compute_ET_variants(P, I, RO, DP, CR, DSF, dS_50)
+
+    # Costruzione DataFrame "Data" con inserimenti ordinati
+    out = df.copy()
+    suffix = extract_suffix(name30, name50)  # es. MB17, SM18
+
+    col_swc_mm_30 = f"SWC_mm_0_30m_{suffix}"
+    col_delta_30  = f"Delta_SWC_mm_0_30m_{suffix}"
+    out = insert_after(out, col_swc_mm_30, swc_mm_30, name30)
+    out = insert_after(out, col_delta_30,  dS_30,      col_swc_mm_30)
+
+    name50_current = find_col(out.columns, ["SWC50"]) or name50
+    col_swc_mm_50 = f"SWC_mm_0_50m_{suffix}"
+    col_delta_50  = f"Delta_SWC_mm_0_50m_{suffix}"
+    out = insert_after(out, col_swc_mm_50, swc_mm_50, name50_current)
+    out = insert_after(out, col_delta_50,  dS_50,     col_swc_mm_50)
+
+    # ET subito dopo i ΔSWC
+    col_ET7_30 = f"ET_eq7_full_0_30m_{suffix}"
+    col_ET8_30 = f"ET_eq8_PIminusdS_0_30m_{suffix}"
+    col_ET9_30 = f"ET_eq9_IminusdS_0_30m_{suffix}"
+    out = insert_after(out, col_ET7_30, ET7_30, col_delta_30)
+    out = insert_after(out, col_ET8_30, ET8_30, col_ET7_30)
+    out = insert_after(out, col_ET9_30, ET9_30, col_ET8_30)
+
+    col_ET7_50 = f"ET_eq7_full_0_50m_{suffix}"
+    col_ET8_50 = f"ET_eq8_PIminusdS_0_50m_{suffix}"
+    col_ET9_50 = f"ET_eq9_IminusdS_0_50m_{suffix}"
+    out = insert_after(out, col_ET7_50, ET7_50, col_delta_50)
+    out = insert_after(out, col_ET8_50, ET8_50, col_ET7_50)
+    out = insert_after(out, col_ET9_50, ET9_50, col_ET8_50)
+
+    # Summary (statistiche base)
+    summary_cols = [
+        col_swc_mm_30, col_swc_mm_50, col_delta_30, col_delta_50,
+        col_ET7_30, col_ET8_30, col_ET9_30,
+        col_ET7_50, col_ET8_50, col_ET9_50,
+    ]
+    summary = summarize(out, summary_cols)
+
+    # Correlation — SOLO cbar ↔ mm (stessa profondità e stesso file)
+    corr_rows = []
+    pm_cbar_mm_30 = pair_metrics(cbar30, swc_mm_30)
+    corr_rows.append({
+        "Pair": f"{suffix} 0-30 cbar vs {suffix} 0-30 mm",
+        **pm_cbar_mm_30
+    })
+    pm_cbar_mm_50 = pair_metrics(cbar50, swc_mm_50)
+    corr_rows.append({
+        "Pair": f"{suffix} 0-50 cbar vs {suffix} 0-50 mm",
+        **pm_cbar_mm_50
+    })
+    corr_df = pd.DataFrame(corr_rows, columns=[
+        "Pair","N","r","p","MSE","RMSE","Bias","MAE","Var_A","Var_B","Std_A","Std_B","Cov"
+    ])
+
+    # Performance (stile richiesto)
+    def series_stats(x: pd.Series):
+        x = pd.to_numeric(x, errors="coerce")
+        N = int(x.notna().sum())
+        mean = float(x.mean(skipna=True)) if N else np.nan
+        std  = float(x.std(skipna=True)) if N > 1 else np.nan
+        cv   = (std/mean) if (N > 1 and pd.notna(mean) and mean != 0 and pd.notna(std)) else np.nan
+        return {"N": N, "Mean (mm)": mean, "Std (mm)": std, "Cv": cv}
+    stats_30 = series_stats(swc_mm_30)
+    stats_50 = series_stats(swc_mm_50)
+    mulching_label = "Self-mulch (SM)" if group == "SM" else "Mung bean (MB)"
+
+    performance_rows = [
+        {
+            "Mulching type": mulching_label,
+            "Soil water content": "SWC (mm)",
+            "Soil depth (cm)": "0-30",
+            "N": stats_30["N"], "Mean (mm)": stats_30["Mean (mm)"], "Std (mm)": stats_30["Std (mm)"], "Cv": stats_30["Cv"],
+            "RMSE (cbar vs mm)": pm_cbar_mm_30["RMSE"], "MSE (cbar vs mm)": pm_cbar_mm_30["MSE"],
+            "MAE (cbar vs mm)": pm_cbar_mm_30["MAE"], "Bias (cbar−mm)": pm_cbar_mm_30["Bias"],
+            "r (cbar vs mm)": pm_cbar_mm_30["r"], "p-value": pm_cbar_mm_30["p"]
+        },
+        {
+            "Mulching type": mulching_label,
+            "Soil water content": "SWC (mm)",
+            "Soil depth (cm)": "30-50",
+            "N": stats_50["N"], "Mean (mm)": stats_50["Mean (mm)"], "Std (mm)": stats_50["Std (mm)"], "Cv": stats_50["Cv"],
+            "RMSE (cbar vs mm)": pm_cbar_mm_50["RMSE"], "MSE (cbar vs mm)": pm_cbar_mm_50["MSE"],
+            "MAE (cbar vs mm)": pm_cbar_mm_50["MAE"], "Bias (cbar−mm)": pm_cbar_mm_50["Bias"],
+            "r (cbar vs mm)": pm_cbar_mm_50["r"], "p-value": pm_cbar_mm_50["p"]
+        }
+    ]
+    performance_df = pd.DataFrame(performance_rows, columns=[
+        "Mulching type","Soil water content","Soil depth (cm)",
+        "N","Mean (mm)","Std (mm)","Cv",
+        "RMSE (cbar vs mm)","MSE (cbar vs mm)","MAE (cbar vs mm)","Bias (cbar−mm)",
+        "r (cbar vs mm)","p-value"
+    ])
+
+    # Scrittura Excel per-file (+ foglio Notes)
+    out_path = path_in.with_name(path_in.stem + "_SWCmm.xlsx")
+    with pd.ExcelWriter(out_path, engine="openpyxl") as xw:
+        out.to_excel(xw, index=False, sheet_name="Data")
+        summary.to_excel(xw, index=False, sheet_name="Summary")
+        corr_df.to_excel(xw, index=False, sheet_name="Correlation")
+        performance_df.to_excel(xw, index=False, sheet_name="Performance")
+        notes_df = pd.DataFrame({"Note": FORMULA_NOTE.splitlines()})
+        notes_df.to_excel(xw, index=False, sheet_name="Notes")
+    print(f"Salvato: {out_path}")
+
+    # PLOT per Spyder
+    plots_dir = ensure_plots_dir(path_in.parent)
+    time_x = detect_time_axis(df)
+
+    plot_ts(time_x, [swc_mm_30, swc_mm_50],
+            [f"SWC 0.30m ({suffix})", f"SWC 0.50m ({suffix})"],
+            f"SWC (mm) — {path_in.stem}", "SWC (mm)",
+            plots_dir / f"{path_in.stem}_SWCmm_timeseries.png", show_plots=True)
+
+    plot_ts(time_x, [dS_30, dS_50],
+            [f"ΔSWC 0.30m ({suffix})", f"ΔSWC 0.50m ({suffix})"],
+            f"ΔSWC (mm/day) — {path_in.stem}", "ΔSWC (mm/day)",
+            plots_dir / f"{path_in.stem}_DeltaSWC_timeseries.png", show_plots=True)
+
+    plot_scatter(cbar30, swc_mm_30,
+                 f"{suffix} 0-30 cbar", f"{suffix} 0-30 mm",
+                 f"Scatter: {suffix} 0-30 cbar vs mm — {path_in.stem}",
+                 plots_dir / f"{path_in.stem}_cbar_vs_mm_0-30_scatter.png", show_plots=True)
+
+    plot_scatter(cbar50, swc_mm_50,
+                 f"{suffix} 0-50 cbar", f"{suffix} 0-50 mm",
+                 f"Scatter: {suffix} 0-50 cbar vs mm — {path_in.stem}",
+                 plots_dir / f"{path_in.stem}_cbar_vs_mm_0-50_scatter.png", show_plots=True)
+
+    # Alimenta aggregatore complessivo (MB/SM)
+    extend_list_from_series(AGG[group]["swc30_mm_all"], swc_mm_30)
+    extend_list_from_series(AGG[group]["swc50_mm_all"], swc_mm_50)
+    mask30 = cbar30.notna() & swc_mm_30.notna()
+    AGG[group]["pairs30_cbar"].extend(cbar30[mask30].tolist())
+    AGG[group]["pairs30_mm"].extend(swc_mm_30[mask30].tolist())
+    mask50 = cbar50.notna() & swc_mm_50.notna()
+    AGG[group]["pairs50_cbar"].extend(cbar50[mask50].tolist())
+    AGG[group]["pairs50_mm"].extend(swc_mm_50[mask50].tolist())
+
+# Main complessivo 
+def main():
+    # Per-file
+    for fname in FILES:
+        process_file(BASE_DIR / fname)
+
+    # Complessivo MB/SM
+    overall_perf, overall_corr = overall_tables()
+    overall_path = BASE_DIR / "Overall_Performance.xlsx"
+    with pd.ExcelWriter(overall_path, engine="openpyxl") as xw:
+        overall_perf.to_excel(xw, index=False, sheet_name="Performance")
+        overall_corr.to_excel(xw, index=False, sheet_name="Correlation")
+    print(f"Salvato: {overall_path}")
+
+if __name__ == "__main__":
+    main()
